@@ -159,14 +159,18 @@ def message_to_text(message):
 def mailbox_text(mb, author):
     """
     Returns the contents of a mailbox as text.
-
     Excludes messages to 'author' and not from 'author'.
 
     :param mb: Mailbox over which to iterate.
     :param author: Excludes messages to and not from this author.
     :return: Nothing.
     """
+    total = 0
+    skipped_html = 0
+    processed = 0
+    
     for message in mb:
+        total += 1
         if not message['From']:
             continue
         if author not in message['From']:
@@ -175,10 +179,28 @@ def mailbox_text(mb, author):
             continue
         if author in message['To']:
             continue
+            
+        has_plain = False
+        for part in message.walk():
+            if part.get_content_type() == 'text/plain':
+                has_plain = True
+                break
+                
+        if not has_plain:
+            skipped_html += 1
+            continue
+            
         text = message_to_text(message)
         text = munge_message(text)
         if text and len(text) > 0:
+            processed += 1
             yield text
+            
+    print(f"\nEmail Processing Statistics:")
+    print(f"Total emails examined: {total}")
+    print(f"Skipped (HTML-only): {skipped_html}")
+    print(f"Successfully processed: {processed}")
+    print(f"HTML-only percentage: {(skipped_html/total*100):.1f}%")
 
 
 def main():
