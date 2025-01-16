@@ -1,6 +1,0 @@
-
-Email Processing Statistics:
-Total emails examined: 1463
-Skipped (HTML-only): 0
-Successfully processed: 0
-HTML-only percentage: 0.0%
