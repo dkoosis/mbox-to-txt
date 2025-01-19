@@ -6,19 +6,19 @@ import sys
 import chardet
 from typing import Dict, List, Optional
 from html.parser import HTMLParser
-
+from email.utils import parsedate_to_datetime
 
 class TextExtractor(HTMLParser):
+    """Extracts text content from HTML."""
     def __init__(self):
         super().__init__()
         self.result = []
 
-    def handle_data(self, d):
-        self.result.append(d)
+    def handle_data(self, data):  # Parameter name changed to 'data'
+        self.result.append(data)
 
     def get_text(self):
         return " ".join(self.result)
-
 
 # --- Configuration ---
 # Headers to remove (add more if needed)
@@ -44,22 +44,72 @@ HEADERS_TO_REMOVE = {
 SIGNATURE_PATTERNS = [
     re.compile(r"^--\s*$"),  # Common signature delimiter
     re.compile(r"^-----Original Message-----", re.IGNORECASE),
-    re.compile(r"^________________________________", re.IGNORECASE),
+    re.compile(r"^________________________________________+", re.IGNORECASE), # Added + for flexibility
     re.compile(r"^\s*On.*wrote:\s*$", re.IGNORECASE),  # often used before quoted text
     re.compile(r"^\s*From:.*$", re.IGNORECASE),  # common in forwarded messages
     re.compile(r"^\s*Sent from my iPhone", re.IGNORECASE),
     re.compile(r"^\s*Sent from Mail for Windows", re.IGNORECASE),
-    re.compile(r"This email may contain confidential information\.", re.IGNORECASE),
+    re.compile(r"This email may contain confidential information\.", re.IGNORECASE),  # Example disclaimer
     # Add more patterns based on your email data
 ]
-# Patterns of text to delete from messages.
+
 DELETION_PATTERNS = [
-    # Forwarded messages:
+    # Forwarded message headers
     r"(\n|^)---------- Forwarded message ----------(.|\n)*$",
-    # PGP:
+    r"(\n|^)-------- Original Message --------(.|\n)*$",
+    r"(\n|^)Begin forwarded message:(.|\n)*$",
+
+    # Email security related
     r"(\n|^)-----BEGIN PGP MESSAGE-----\n(.|\n)*-----END PGP MESSAGE-----\n",
-    # Embedded links:
-    r"<[^ ]+>",
+    r"(\n|^)-----BEGIN PGP SIGNATURE-----\n(.|\n)*-----END PGP SIGNATURE-----\n",
+
+    # HTML and CSS cleanup
+    r"<[^>]+>",  # HTML tags
+    r"/\*[\s\S]*?\*/",  # CSS comments
+    r"",  # HTML comments
+    r"<style[^>]*>[\s\S]*?</style>",  # Style tags and contents
+
+    # CSS rules and declarations
+    r"@font-face\s*{[^}]*}",  # Font face declarations
+    r"@page[^}]*}",  # Page rules
+    r"\.[\w-]+\s*{[^}]*}",  # CSS class definitions
+    r"@import url\([^)]*\);",  # CSS imports
+    r"@media[^{]*{[^}]*}",  # Media queries
+    r"body\s*{[^}]*}",  # Body style definitions
+    r"table\s*{[^}]*}",  # Table style definitions
+    r"#[\w-]+\s*{[^}]*}",  # ID-based style definitions
+
+    # Email client specific
+    r"_{10,}",  # Long underline separators
+    r"\[cid:[^\]]+\]",  # Content-ID references
+    r"Content-Type: \S+\n",  # Content type headers (Consider removing if needed)
+    r"Content-Transfer-Encoding: \S+\n",  # Transfer encoding headers (Consider removing if needed)
+
+    # Calendar invite cleanup
+    r"This email has been scanned for.*$",
+    r"Click here to report this email as spam.*$",
+    r"You are receiving this.*calendar notifications.*$",
+    r"Invitation from Google Calendar:.*$",
+
+    # Reply markers
+    r"On.*wrote:$",
+    r"From:.*Sent:.*To:.*Subject:",
+
+    # Disclaimer blocks
+    r"CONFIDENTIALITY NOTICE:[\s\S]*?$",
+    r"DISCLAIMER:[\s\S]*?$",
+    r"This email and any files.*confidential.*$",
+
+    # Signature separators
+    r"^--\s*$",  # Simple signature delimiter
+    r"_{30,}",  # Long signature separator
+    r"-{30,}",  # Alternative signature separator
+
+    # Email client formatting
+    r"@-webkit-keyframes[^{]*{[^}]*}",
+    r"@keyframes[^{]*{[^}]*}",
+    r"@-ms-viewport[^{]*{[^}]*}",
+    r"@viewport[^{]*{[^}]*}"
 ]
 
 # Pre-compile regular expressions for efficiency
@@ -68,6 +118,13 @@ COMPILED_SIGNATURE_PATTERNS = [re.compile(pattern) for pattern in SIGNATURE_PATT
 
 
 # --- Functions ---
+# Add new function to detect auto-responses
+def is_auto_response(message: mailbox.mboxMessage) -> bool:
+    """Returns True if message appears to be an auto-response."""
+    subject = message.get("Subject", "").lower()
+    auto_subjects = {"automatic reply", "out of office", "auto-reply"}
+    return any(auto in subject for auto in auto_subjects)
+
 
 def munge_message(text):
     """
@@ -192,11 +249,10 @@ def detect_encoding(part):
     detected_encoding = chardet.detect(payload)["encoding"]
     return detected_encoding or "utf-8"  # Use utf-8 as fallback
 
-
 def part_to_text(part):
     """
     Converts an e-mail message part into text, handling encoding with chardet.
-    Handles both plain text and HTML parts.
+    Handles both plain text and HTML parts, and multipart messages.
 
     :param part: E-mail message part.
     :return: Message text.
@@ -213,11 +269,20 @@ def part_to_text(part):
             if not payload:
                 return None
 
-            text = payload.decode(charset, errors="replace")  # Decode using detected charset
+            text = payload.decode(charset, errors="replace")
 
             if part.get_param("format") == "flowed":
                 text = unflow_text(text, part.get_param("delsp", False))
             return text
+
+        except UnicodeDecodeError:
+            print(f"UnicodeDecodeError decoding part with charset {charset}. Trying latin-1.", file=sys.stderr)
+            try:
+                text = payload.decode('latin-1', errors="replace")
+                return text
+            except UnicodeDecodeError as e:  # Catch UnicodeDecodeError again
+                print(f"Error decoding with latin-1: {e}", file=sys.stderr)
+                return None
 
         except Exception as e:
             print(f"Error decoding part with charset {charset}: {e}", file=sys.stderr)
@@ -238,28 +303,33 @@ def part_to_text(part):
             extractor.feed(text)
             return extractor.get_text()
 
-        except Exception as e:
+        except UnicodeDecodeError:
+            print(f"UnicodeDecodeError processing HTML content. Trying latin-1.", file=sys.stderr)
+            try:
+                text = payload.decode('latin-1', errors="replace")
+                extractor = TextExtractor()
+                extractor.feed(text)
+                return extractor.get_text()
+            except Exception as e:
+                print(f"Error processing HTML content with latin-1: {e}", file=sys.stderr)
+                return None
+
+        except Exception as e:  # Handle other potential exceptions
             print(f"Error processing HTML content: {e}", file=sys.stderr)
             return None
+
+    elif content_type.startswith("multipart"):
+        # Handle multipart messages by recursively calling part_to_text
+        text = ""
+        for sub_part in part.get_payload():
+            part_text = part_to_text(sub_part)
+            if part_text:
+                text += part_text
+        return text
+
     else:
         return None
-
-
-def message_to_text(message):
-    """
-    Converts an e-mail message into text.
-
-    :param message: E-mail message.
-    :return: Message text.
-    """
-    text = ""
-    for part in message.walk():
-        part_text = part_to_text(part)
-        if part_text:
-            text += part_text
-    return text
-
-
+   
 def matches_filter(
     message: mailbox.mboxMessage,
     to_filters: List[str],
@@ -308,13 +378,130 @@ def create_skip_mboxes(save_dir: str) -> Dict[str, mailbox.mbox]:
 
     return skip_mboxes
 
+def create_special_mboxes(save_dir: str) -> Dict[str, mailbox.mbox]:
+    """Create mbox files for different special categories"""
+    special_mboxes = {}
+    categories = [
+        "tickets",
+    ]
+
+    for category in categories:
+        filename = os.path.join(save_dir, f"special-{category}.mbox")
+        special_mboxes[category] = mailbox.mbox(filename)
+
+    return special_mboxes
+
+def save_to_skip_mbox(mbox, message):
+    """
+    Safely save a message to skip mbox, handling both string and list payloads.
+    
+    :param mbox: The mbox to save to
+    :param message: The message to save
+    """
+    try:
+        if message.is_multipart():
+            # For multipart messages, we need to handle the full message structure
+            new_message = mailbox.mboxMessage()
+            # Copy all headers
+            for key, value in message.items():
+                new_message[key] = value
+            # Set the payload with the full MIME structure
+            new_message.set_payload(message.get_payload())
+            mbox.add(new_message)
+        else:
+            # For simple messages, converting to string should work
+            message_string = message.as_string()
+            new_message = mailbox.mboxMessage(message_string)
+            mbox.add(new_message)
+        
+        mbox.flush()  # Ensure changes are written to disk
+        
+    except Exception as e:
+        print(f"Error saving message to mbox: {str(e)}", file=sys.stderr)
+
+def get_header_string(message, header_name):
+    """
+    Safely retrieves a header value from an email message, handling lists.
+
+    Args:
+        message: The email message.
+        header_name: The name of the header to retrieve.
+
+    Returns:
+        The header value as a string, or an empty string if not found or if a list is encountered.
+    """
+    header_value = message.get(header_name)
+    if isinstance(header_value, list):
+        # Option 1: Join with a separator (e.g., comma)
+        return ", ".join(header_value)
+        # Option 2: Take the first element (if it makes sense for the header)
+        # return header_value[0] if header_value else "" 
+    elif isinstance(header_value, str):
+        return header_value
+    else:
+        return ""
+def parse_date(date_str):
+    """
+    Parses a date string from an email header into a formatted date string.
+
+    :param date_str: The date string from the email header.
+    :return: A formatted date string or "Invalid Date Format" if parsing fails.
+    """
+    try:
+        dt = parsedate_to_datetime(date_str)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError, OverflowError):
+        return "Invalid Date Format"
+
+def remove_quoted_text(text: str) -> str:
+    """
+    Remove quoted text from email content using common markers.
+    Preserves the original message while removing quoted replies/forwards.
+    
+    Args:
+        text (str): Raw email message text
+        
+    Returns:
+        str: Email text with quotes removed
+    """
+    # Split into lines for processing
+    lines = text.splitlines()
+    cleaned_lines = []
+    skip_mode = False
+    
+    for line in lines:
+        # Check for start of quoted text
+        if re.match(r'^\s*On\s+.*wrote:$', line) or \
+           re.match(r'^\s*-{3,}\s*Original Message\s*-{3,}', line) or \
+           re.match(r'^\s*From:.*Sent:.*To:.*Subject:', line):
+            skip_mode = True
+            continue
+            
+        # Skip lines starting with '>' and any following indented content
+        if line.startswith('>') or line.startswith('&gt;'):
+            skip_mode = True
+            continue
+            
+        # If we hit a non-quoted, non-indented line, turn off skip mode
+        if skip_mode and line.strip() and not line.startswith(' '):
+            skip_mode = False
+            
+        # Keep lines that aren't being skipped
+        if not skip_mode:
+            cleaned_lines.append(line)
+    
+    # Clean up any artifacts
+    result = '\n'.join(cleaned_lines)
+    result = re.sub(r'\n{3,}', '\n\n', result)  # Normalize multiple blank lines
+    return result.strip()
 
 def mailbox_text(
-    mb,
-    to_filters=None,
-    from_filters=None,
-    subject_filters=None,
-    save_skipped: Optional[str] = None,
+        mb,
+        to_filters=None,
+        from_filters=None,
+        subject_filters=None,
+        save_skipped: Optional[str] = "output",
+        output_dir: Optional[str] = "output"
 ):
     """
     Returns the contents of a mailbox as text.
@@ -325,29 +512,50 @@ def mailbox_text(
     from_filters = from_filters or []
     subject_filters = subject_filters or []
 
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, "tickets"), exist_ok=True)  # Create tickets sub-directory
     skip_mboxes = create_skip_mboxes(save_skipped) if save_skipped else {}
+    special_mboxes = create_special_mboxes(save_skipped) if save_skipped else {}
 
     total = 0
     skipped_filter = 0
     no_content = 0
     processed = 0
     empty_after_munge = 0
-    total_incoming_word_count = 0
-    total_outgoing_word_count = 0
+    total_word_count = 0
+    chunk_word_count = 0
+    chunk_counter = 1
+    current_chunk_name = os.path.join(output_dir, f"output_{chunk_counter}.txt")
+    current_chunk_file = open(current_chunk_name, "w", encoding="utf-8")
 
     try:
         for message in mb:
             total += 1
+            text = ""
+
+            # Skip auto-responses
+            if is_auto_response(message):
+                skipped_filter += 1
+                continue
 
             # Apply filters
             if not matches_filter(message, to_filters, from_filters, subject_filters):
                 skipped_filter += 1
                 continue
 
+            # Check for ticket emails
+            subject = message.get("Subject", "")
+            if subject.startswith("Ticket#"):
+                if save_skipped:
+                    try:
+                        save_to_skip_mbox(special_mboxes["tickets"], message)
+                    except Exception as e:
+                        print(f"Error adding ticket email to mbox: {e}")
+                continue
+
             # Check content types and extract text
             has_plain = False
             has_html = False
-            text = ""
 
             remove_headers(message)  # Remove headers before processing parts
 
@@ -362,18 +570,20 @@ def mailbox_text(
             if not has_plain and not has_html:
                 no_content += 1
                 if save_skipped:
-                    skip_mboxes["no-content"].add(message)
+                    try:
+                        save_to_skip_mbox(skip_mboxes["no-content"], message)
+                    except Exception as e:
+                        print(f"Error adding message to 'no-content' mbox: {e}")
                 continue
-
-            # Count incoming words
-            incoming_word_count = len(text.split())
-            total_incoming_word_count += incoming_word_count
 
             # Munge, remove signature, and clean up whitespace
             text = munge_message(text)
+            text = remove_quoted_text(text)  
             text = remove_signature(text)
             lines = text.splitlines()
             processed_lines = []
+
+            # Process the lines
             for line in lines:
                 line = line.strip()
                 line = re.sub(r"\s+", " ", line)  # Reduce multiple spaces to single spaces
@@ -385,28 +595,60 @@ def mailbox_text(
             if not text or len(text.strip()) == 0:
                 empty_after_munge += 1
                 if save_skipped:
-                    skip_mboxes["empty-after-munge"].add(message)
-                continue
+                    try:
+                        save_to_skip_mbox(skip_mboxes["empty-after-munge"], message)
+                    except Exception as e:
+                        print(f"Error saving skipped message: {e}", file=sys.stderr)
+                continue  # Skip further processing for empty messages
+
+            # Word count for the current message, AFTER processing
+            message_word_count = len(text.split())
+
+            # Check if adding the current message would exceed the word limit
+            if chunk_word_count + message_word_count > 500000:
+                current_chunk_file.close()
+                chunk_counter += 1
+                current_chunk_name = os.path.join(output_dir, f"output_{chunk_counter}.txt")
+                current_chunk_file = open(current_chunk_name, "w", encoding="utf-8")
+                chunk_word_count = 0
+
+            # Add the message to the current chunk
+            current_chunk_file.write("=== EMAIL START ===\n")
+
+            # Extract and format metadata
+            from_header = get_header_string(message, "From")
+            to_header = get_header_string(message, "To")
+            subject_header = get_header_string(message, "Subject")
+            date_header = parse_date(message.get("Date"))
+
+
+            # Write metadata to file
+            current_chunk_file.write(f"From: {from_header}\n")
+            current_chunk_file.write(f"To: {to_header}\n")
+            current_chunk_file.write(f"Date: {date_header}\n")
+            current_chunk_file.write(f"Subject: {subject_header}\n\n")
+
+            # Write the message content
+            current_chunk_file.write(text)
+            current_chunk_file.write("\n=== EMAIL END ===\n\n")
+
+            # Update word counts
+            chunk_word_count += message_word_count
+            total_word_count += message_word_count
 
             processed += 1
 
-            # Count outgoing words
-            outgoing_word_count = len(text.split())
-            total_outgoing_word_count += outgoing_word_count
-
-            yield text
-
     finally:
+        current_chunk_file.close()  # Ensure the last chunk file is closed
+
         # Close all skip mboxes
         if save_skipped:
             for mbox in skip_mboxes.values():
                 mbox.close()
 
-    # Calculate percentage reduction
-    if total_incoming_word_count > 0:
-      percent_reduction = ((total_incoming_word_count - total_outgoing_word_count) / total_incoming_word_count) * 100
-    else:
-      percent_reduction = 0
+            # Close all special mboxes
+            for mbox in special_mboxes.values():
+                mbox.close()
 
     # Print statistics
     print(f"\nEmail Processing Statistics:", file=sys.stderr)
@@ -415,9 +657,7 @@ def mailbox_text(
     print(f"Skipped (no text content): {no_content}", file=sys.stderr)
     print(f"Skipped (empty after cleaning): {empty_after_munge}", file=sys.stderr)
     print(f"Successfully processed: {processed}", file=sys.stderr)
-    print(f"Total incoming words: {total_incoming_word_count}", file=sys.stderr)
-    print(f"Total outgoing words: {total_outgoing_word_count}", file=sys.stderr)
-    print(f"Word count reduction: {percent_reduction:.2f}%", file=sys.stderr)
+    print(f"Total words processed: {total_word_count}", file=sys.stderr)
 
     unprocessed = total - processed - skipped_filter
     print(f"\nSummary:", file=sys.stderr)
@@ -427,12 +667,22 @@ def mailbox_text(
     if save_skipped:
         print(f"\nSkipped emails saved to:", file=sys.stderr)
         for category, mbox in skip_mboxes.items():
-            path = mbox._path
+            path = mbox._path  # Accessing protected member _path
+            size = os.path.getsize(path)
+            if size > 0:
+                print(f"  {path} ({size} bytes)", file=sys.stderr)
+
+        print(f"\nSpecial emails saved to:", file=sys.stderr)
+        for category, mbox in special_mboxes.items():
+            path = mbox._path  # Accessing protected member _path
             size = os.path.getsize(path)
             if size > 0:
                 print(f"  {path} ({size} bytes)", file=sys.stderr)
 
 def main():
+    """
+    entry
+    """
     parser = argparse.ArgumentParser(
         description="Convert mbox to text file with flexible filtering.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -457,7 +707,14 @@ def main():
     parser.add_argument(
         "--save-skipped",
         metavar="DIR",
-        help="Save skipped emails to mbox files in specified directory",
+        help="Save skipped emails to mbox files in specified directory (default: output)",
+        default="output"
+    )
+    parser.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        help="Directory to save output text files (default: output)",
+        default="output"
     )
 
     args = parser.parse_args()
@@ -466,8 +723,7 @@ def main():
         os.makedirs(args.save_skipped, exist_ok=True)
 
     mb = mailbox.mbox(args.mbox_file, create=False)
-    for text in mailbox_text(mb, args.to, args.from_, args.subject, args.save_skipped):
-        print(text)
+    mailbox_text(mb, args.to, args.from_, args.subject, args.save_skipped, args.output_dir)
 
 
 if __name__ == "__main__":
