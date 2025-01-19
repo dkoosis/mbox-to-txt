@@ -304,7 +304,7 @@ def part_to_text(part):
             return extractor.get_text()
 
         except UnicodeDecodeError:
-            print(f"UnicodeDecodeError processing HTML content. Trying latin-1.", file=sys.stderr)
+            print("UnicodeDecodeError processing HTML content. Trying latin-1.", file=sys.stderr)
             try:
                 text = payload.decode('latin-1', errors="replace")
                 extractor = TextExtractor()
@@ -495,13 +495,127 @@ def remove_quoted_text(text: str) -> str:
     result = re.sub(r'\n{3,}', '\n\n', result)  # Normalize multiple blank lines
     return result.strip()
 
+def should_start_new_chunk(current_chunk_text: str, new_text: str, max_words: int = 190000, max_mb: float = 0.95) -> bool:
+    """
+    Determines if a new chunk should be started based on NotebookLM constraints.
+    Uses slightly lower limits (190k words, 0.95MB) as safety margins.
+    
+    Args:
+        current_chunk_text: Current accumulated text in the chunk
+        new_text: New text to be added
+        max_words: Maximum word count (default: 190000)
+        max_mb: Maximum file size in MB (default: 0.95)
+    
+    Returns:
+        bool: True if a new chunk should be started
+    """
+    # Check word count
+    current_words = len(current_chunk_text.split())
+    new_words = len(new_text.split())
+    if current_words + new_words > max_words:
+        return True
+        
+    # Check file size
+    current_bytes = len(current_chunk_text.encode('utf-8'))
+    new_bytes = len(new_text.encode('utf-8'))
+    total_mb = (current_bytes + new_bytes) / (1024 * 1024)
+    if total_mb > max_mb:
+        return True
+        
+    return False
+
+def contains_keywords(text: str, keywords: List[str]) -> bool:
+    """
+    Check if any of the keywords appear in the text.
+    Case-insensitive matching.
+    
+    Args:
+        text: The text to search in
+        keywords: List of keywords to search for
+        
+    Returns:
+        bool: True if any keyword is found in the text
+    """
+    if not keywords:  # If no keywords specified, consider it a match
+        return True
+        
+    text = text.lower()
+    return any(keyword.lower() in text for keyword in keywords)
+
+
+def matches_combined_filter(
+    message: mailbox.mboxMessage,
+    text: str,
+    to_filters: List[str],
+    from_filters: List[str],
+    subject_filters: List[str],
+    content_keywords: List[str],
+    address_or_content_keywords: List[str]  # Keywords to match in addresses, subject, or content
+) -> bool:
+    """
+    Check if a message matches the combined filtering criteria.
+    Handles both standard filters and keywords that can match in addresses, subject, or content.
+    
+    Args:
+        message: The email message
+        text: The extracted message text content
+        to_filters: List of strings to match in To: field
+        from_filters: List of strings to match in From: field
+        subject_filters: List of strings to match in Subject: field
+        content_keywords: List of strings to match in message content
+        address_or_content_keywords: List of strings to match in addresses, subject, or content
+    
+    Returns:
+        bool: True if message matches the filtering criteria
+    """
+    def matches_any(header_value: Optional[str], filters: List[str]) -> bool:
+        if not filters:
+            return True
+        if not header_value:
+            return False
+        header_value = header_value.lower()
+        return any(f.lower() in header_value for f in filters)
+
+    # Check standard filters first
+    if not matches_any(message.get("To"), to_filters):
+        return False
+    if not matches_any(message.get("From"), from_filters):
+        return False
+    if not matches_any(message.get("Subject"), subject_filters):
+        return False
+    if not contains_keywords(text, content_keywords):
+        return False
+
+    # If there are no address_or_content_keywords, we're done
+    if not address_or_content_keywords:
+        return True
+
+    # Check if any keyword appears in addresses, subject, or content
+    from_addr = message.get("From", "").lower()
+    to_addr = message.get("To", "").lower()
+    cc_addr = message.get("Cc", "").lower()  # Add CC field check
+    subject = message.get("Subject", "").lower()
+
+    for keyword in [k.lower() for k in address_or_content_keywords]:    
+        # Check addresses, subject, and content
+        if (keyword in from_addr or 
+            keyword in to_addr or
+            keyword in cc_addr or  # Add CC to the check
+            keyword in subject or 
+            keyword in text.lower()):
+            return True
+    
+    return False
+
 def mailbox_text(
-        mb,
-        to_filters=None,
-        from_filters=None,
-        subject_filters=None,
-        save_skipped: Optional[str] = "output",
-        output_dir: Optional[str] = "output"
+    mb,
+    to_filters,
+    from_filters,
+    subject_filters,
+    content_keywords,
+    address_or_content_keywords,
+    save_skipped,
+    output_dir
 ):
     """
     Returns the contents of a mailbox as text.
@@ -523,10 +637,10 @@ def mailbox_text(
     processed = 0
     empty_after_munge = 0
     total_word_count = 0
-    chunk_word_count = 0
     chunk_counter = 1
     current_chunk_name = os.path.join(output_dir, f"output_{chunk_counter}.txt")
     current_chunk_file = open(current_chunk_name, "w", encoding="utf-8")
+    current_chunk_text = ""  
 
     try:
         for message in mb:
@@ -539,23 +653,22 @@ def mailbox_text(
                 continue
 
             # Apply filters
-            if not matches_filter(message, to_filters, from_filters, subject_filters):
+            if not matches_combined_filter(
+                message,
+                text,
+                to_filters,
+                from_filters,
+                subject_filters,
+                content_keywords,
+                address_or_content_keywords
+            ):
                 skipped_filter += 1
-                continue
-
-            # Check for ticket emails
-            subject = message.get("Subject", "")
-            if subject.startswith("Ticket#"):
-                if save_skipped:
-                    try:
-                        save_to_skip_mbox(special_mboxes["tickets"], message)
-                    except Exception as e:
-                        print(f"Error adding ticket email to mbox: {e}")
                 continue
 
             # Check content types and extract text
             has_plain = False
             has_html = False
+            text = ""
 
             remove_headers(message)  # Remove headers before processing parts
 
@@ -576,10 +689,18 @@ def mailbox_text(
                         print(f"Error adding message to 'no-content' mbox: {e}")
                 continue
 
-            # Munge, remove signature, and clean up whitespace
-            text = munge_message(text)
-            text = remove_quoted_text(text)  
-            text = remove_signature(text)
+            # Process based on email type
+            #subject = message.get("Subject", "")
+            if is_ticket_email(message):
+                metadata = extract_ticket_metadata(message)
+                text = clean_ticket_content(text)
+                text = format_ticket_output(text, metadata)
+            else:
+                # Munge, remove signature, and clean up whitespace
+                text = munge_message(text)
+                text = remove_quoted_text(text)  
+                text = remove_signature(text)
+
             lines = text.splitlines()
             processed_lines = []
 
@@ -604,42 +725,48 @@ def mailbox_text(
             # Word count for the current message, AFTER processing
             message_word_count = len(text.split())
 
-            # Check if adding the current message would exceed the word limit
-            if chunk_word_count + message_word_count > 500000:
-                current_chunk_file.close()
-                chunk_counter += 1
-                current_chunk_name = os.path.join(output_dir, f"output_{chunk_counter}.txt")
-                current_chunk_file = open(current_chunk_name, "w", encoding="utf-8")
-                chunk_word_count = 0
-
-            # Add the message to the current chunk
-            current_chunk_file.write("=== EMAIL START ===\n")
-
             # Extract and format metadata
             from_header = get_header_string(message, "From")
             to_header = get_header_string(message, "To")
             subject_header = get_header_string(message, "Subject")
             date_header = parse_date(message.get("Date"))
 
+            # Prepare message text
+            message_text = "=== EMAIL START ===\n"
+            message_text += f"From: {from_header}\n"
+            message_text += f"To: {to_header}\n"
+            message_text += f"Date: {date_header}\n"
+            message_text += f"Subject: {subject_header}\n\n"
+            message_text += text
+            message_text += "\n=== EMAIL END ===\n\n"
 
-            # Write metadata to file
-            current_chunk_file.write(f"From: {from_header}\n")
-            current_chunk_file.write(f"To: {to_header}\n")
-            current_chunk_file.write(f"Date: {date_header}\n")
-            current_chunk_file.write(f"Subject: {subject_header}\n\n")
+            # Check if we need to start a new chunk
+            if should_start_new_chunk(current_chunk_text, message_text):
+                # Write current chunk and start new one
+                current_chunk_file.write(current_chunk_text)
+                current_chunk_file.close()
+                
+                # Start new chunk
+                chunk_counter += 1
+                current_chunk_name = os.path.join(output_dir, f"output_{chunk_counter}.txt")
+                current_chunk_file = open(current_chunk_name, "w", encoding="utf-8")
+                current_chunk_text = message_text
+            else:
+                current_chunk_text += message_text
 
-            # Write the message content
-            current_chunk_file.write(text)
-            current_chunk_file.write("\n=== EMAIL END ===\n\n")
+            # Update total word count
+            total_word_count += len(text.split())
 
             # Update word counts
-            chunk_word_count += message_word_count
             total_word_count += message_word_count
 
             processed += 1
 
     finally:
-        current_chunk_file.close()  # Ensure the last chunk file is closed
+        # Write the final chunk if there's any content left
+        if current_chunk_text:
+            current_chunk_file.write(current_chunk_text)       
+            current_chunk_file.close()  # Ensure the last chunk file is closed
 
         # Close all skip mboxes
         if save_skipped:
@@ -651,7 +778,7 @@ def mailbox_text(
                 mbox.close()
 
     # Print statistics
-    print(f"\nEmail Processing Statistics:", file=sys.stderr)
+    print("\nEmail Processing Statistics:", file=sys.stderr)
     print(f"Total emails examined: {total}", file=sys.stderr)
     print(f"Skipped (didn't match filters): {skipped_filter}", file=sys.stderr)
     print(f"Skipped (no text content): {no_content}", file=sys.stderr)
@@ -660,28 +787,124 @@ def mailbox_text(
     print(f"Total words processed: {total_word_count}", file=sys.stderr)
 
     unprocessed = total - processed - skipped_filter
-    print(f"\nSummary:", file=sys.stderr)
+    print("\nSummary:", file=sys.stderr)
     print(f"Processed: {processed} ({processed/total*100:.1f}%)", file=sys.stderr)
     print(f"Unprocessed: {unprocessed} ({unprocessed/total*100:.1f}%)", file=sys.stderr)
 
     if save_skipped:
-        print(f"\nSkipped emails saved to:", file=sys.stderr)
-        for category, mbox in skip_mboxes.items():
-            path = mbox._path  # Accessing protected member _path
+        print("\nSkipped emails saved to:", file=sys.stderr)
+        for mbox in special_mboxes.values():
+            path = mbox._path  # pylint: disable=protected-access
             size = os.path.getsize(path)
             if size > 0:
                 print(f"  {path} ({size} bytes)", file=sys.stderr)
 
-        print(f"\nSpecial emails saved to:", file=sys.stderr)
-        for category, mbox in special_mboxes.items():
-            path = mbox._path  # Accessing protected member _path
+        print("\nSpecial emails saved to:", file=sys.stderr)
+        for mbox in special_mboxes.values():
+            path = mbox._path  # pylint: disable=protected-access
             size = os.path.getsize(path)
             if size > 0:
                 print(f"  {path} ({size} bytes)", file=sys.stderr)
+
+def is_ticket_email(message) -> bool:
+    """Check if this is a ticket-related email based on subject"""
+    subject = message.get("Subject", "")
+    return subject.startswith("Ticket#") or "has been updated" in subject.lower()
+
+def clean_ticket_content(text: str) -> str:
+    """
+    Clean ticket email content for NotebookLM ingestion.
+    Preserves key information while removing noise.
+    """
+    # Remove common ticket noise
+    noise_patterns = [
+        r"--REPLY above this line to respond--",
+        r"This email has been scanned for spam",
+        r"Summary:(?:[^\n]*\n){1,10}?Discussion",  # Remove redundant summary blocks
+        r"Click here to report this email as spam",
+        r"This email was automatically generated",
+        r"You are receiving this email because",
+    ]
+    
+    for pattern in noise_patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE|re.MULTILINE)
+
+    # Extract the meaningful discussion content
+    discussion_pattern = r"Discussion\n(.*?)(?=\n=== EMAIL (START|END) ===|$)"
+    discussion_match = re.search(discussion_pattern, text, re.DOTALL)
+    if discussion_match:
+        discussion = discussion_match.group(1).strip()
+    else:
+        discussion = text
+
+    # Clean up the discussion
+    lines = []
+    current_update = []
+    timestamp = None
+    
+    for line in discussion.split('\n'):
+        line = line.strip()
+        
+        # Skip empty lines and noise
+        if not line or line in ['Discussion', 'Summary:', 'Status:', '-']:
+            continue
+            
+        # Check for timestamp lines that mark updates
+        timestamp_match = re.match(r'(\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s*(?:AM|PM))-?$', line)
+        if timestamp_match:
+            # If we have a previous update, add it
+            if current_update:
+                lines.append(f"[{timestamp}]")
+                lines.extend(current_update)
+                lines.append("")  # Add spacing between updates
+            timestamp = timestamp_match.group(1)
+            current_update = []
+            continue
+
+        # Add meaningful content to current update
+        if line and not re.match(r'^[_-]{3,}$', line):  # Skip separator lines
+            current_update.append(line)
+    
+    # Add the last update if we have one
+    if current_update:
+        lines.append(f"[{timestamp}]" if timestamp else "")
+        lines.extend(current_update)
+
+    # Join everything back together
+    result = "\n".join(lines)
+    
+    # Clean up any artifacts from the processing
+    result = re.sub(r'\n{3,}', '\n\n', result)  # Normalize multiple blank lines
+    result = re.sub(r'^\s+', '', result, flags=re.MULTILINE)  # Remove leading whitespace
+    
+    return result.strip()
+
+def extract_ticket_metadata(message) -> dict:
+    """Extract key metadata from ticket email"""
+    subject = message.get("Subject", "")
+    
+    # Try to extract ticket number
+    ticket_match = re.search(r'Ticket#(\d+)', subject)
+    ticket_num = ticket_match.group(1) if ticket_match else None
+    
+    metadata = {
+        "ticket_number": ticket_num,
+        "timestamp": parse_date(message.get("Date")),
+        "type": "ticket_update" if "has been updated" in subject else "ticket_creation"
+    }
+    
+    return metadata
+
+def format_ticket_output(text: str, metadata: dict) -> str:
+    """Format the final ticket content for NotebookLM"""
+    header = f"=== TICKET #{metadata['ticket_number']} UPDATE ==="
+    timestamp = f"Date: {metadata['timestamp']}"
+    
+    return f"{header}\n{timestamp}\n\n{text}\n=== END TICKET UPDATE ===\n"
 
 def main():
     """
-    entry
+    Process command line arguments and run the mbox conversion.
     """
     parser = argparse.ArgumentParser(
         description="Convert mbox to text file with flexible filtering.",
@@ -705,6 +928,18 @@ def main():
         metavar="TEXT",
     )
     parser.add_argument(
+        "--content-keywords",
+        action="append",
+        help="Filter emails containing TEXT in message content",
+        metavar="TEXT",
+    )
+    parser.add_argument(
+        "--address-or-content-keywords",
+        action="append",
+        help="Filter emails containing TEXT in addresses, subject, or content",
+        metavar="TEXT",
+    )
+    parser.add_argument(
         "--save-skipped",
         metavar="DIR",
         help="Save skipped emails to mbox files in specified directory (default: output)",
@@ -723,8 +958,16 @@ def main():
         os.makedirs(args.save_skipped, exist_ok=True)
 
     mb = mailbox.mbox(args.mbox_file, create=False)
-    mailbox_text(mb, args.to, args.from_, args.subject, args.save_skipped, args.output_dir)
-
+    mailbox_text(
+        mb,
+        args.to,
+        args.from_,
+        args.subject,
+        args.content_keywords or [],
+        args.address_or_content_keywords or [],
+        args.save_skipped,
+        args.output_dir
+    )
 
 if __name__ == "__main__":
     main()
