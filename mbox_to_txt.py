@@ -637,10 +637,11 @@ def mailbox_text(
     processed = 0
     empty_after_munge = 0
     total_word_count = 0
-    chunk_counter = 1
-    current_chunk_name = os.path.join(output_dir, f"output_{chunk_counter}.txt")
-    current_chunk_file = open(current_chunk_name, "w", encoding="utf-8")
-    current_chunk_text = ""  
+    file_counter = 1
+    current_file_name = os.path.join(output_dir, f"output_{file_counter}.txt")
+    current_file = open(current_file_name, "w", encoding="utf-8")
+    processed_count = 0
+    messages_per_file = 500 # Adjust this based on testing
 
     try:
         for message in mb:
@@ -690,7 +691,6 @@ def mailbox_text(
                 continue
 
             # Process based on email type
-            #subject = message.get("Subject", "")
             if is_ticket_email(message):
                 metadata = extract_ticket_metadata(message)
                 text = clean_ticket_content(text)
@@ -698,7 +698,7 @@ def mailbox_text(
             else:
                 # Munge, remove signature, and clean up whitespace
                 text = munge_message(text)
-                text = remove_quoted_text(text)  
+                text = remove_quoted_text(text)
                 text = remove_signature(text)
 
             lines = text.splitlines()
@@ -722,9 +722,6 @@ def mailbox_text(
                         print(f"Error saving skipped message: {e}", file=sys.stderr)
                 continue  # Skip further processing for empty messages
 
-            # Word count for the current message, AFTER processing
-            message_word_count = len(text.split())
-
             # Extract and format metadata
             from_header = get_header_string(message, "From")
             to_header = get_header_string(message, "To")
@@ -740,33 +737,31 @@ def mailbox_text(
             message_text += text
             message_text += "\n=== EMAIL END ===\n\n"
 
-            # Check if we need to start a new chunk
-            if should_start_new_chunk(current_chunk_text, message_text):
-                # Write current chunk and start new one
-                current_chunk_file.write(current_chunk_text)
-                current_chunk_file.close()
-                
-                # Start new chunk
-                chunk_counter += 1
-                current_chunk_name = os.path.join(output_dir, f"output_{chunk_counter}.txt")
-                current_chunk_file = open(current_chunk_name, "w", encoding="utf-8")
-                current_chunk_text = message_text
-            else:
-                current_chunk_text += message_text
+            # Write directly to output file:
+            current_file.write(message_text)
+
+            processed_count += 1
+
+            # Check if it's time to start a new output file
+            if processed_count >= messages_per_file:
+                current_file.close()
+
+                # Start new file
+                file_counter += 1
+                current_file_name = os.path.join(output_dir, f"output_{file_counter}.txt")
+                current_file = open(current_file_name, "w", encoding="utf-8")
+
+                processed_count = 0  # Reset counter
 
             # Update total word count
             total_word_count += len(text.split())
 
-            # Update word counts
-            total_word_count += message_word_count
-
             processed += 1
 
     finally:
-        # Write the final chunk if there's any content left
-        if current_chunk_text:
-            current_chunk_file.write(current_chunk_text)       
-            current_chunk_file.close()  # Ensure the last chunk file is closed
+        # Ensure the last file is closed
+        if current_file:
+            current_file.close()
 
         # Close all skip mboxes
         if save_skipped:
@@ -793,7 +788,7 @@ def mailbox_text(
 
     if save_skipped:
         print("\nSkipped emails saved to:", file=sys.stderr)
-        for mbox in special_mboxes.values():
+        for mbox in skip_mboxes.values():
             path = mbox._path  # pylint: disable=protected-access
             size = os.path.getsize(path)
             if size > 0:
@@ -805,7 +800,7 @@ def mailbox_text(
             size = os.path.getsize(path)
             if size > 0:
                 print(f"  {path} ({size} bytes)", file=sys.stderr)
-
+                
 def is_ticket_email(message) -> bool:
     """Check if this is a ticket-related email based on subject"""
     subject = message.get("Subject", "")
